@@ -984,7 +984,7 @@ def start_userbot(cfg, loop):
     loop.run_until_complete(userbot.connect())
     if not loop.run_until_complete(userbot.is_user_authorized()):
         log.warning("Userbot session is not logged in; run `python bot.py --login`. /read disabled.")
-        loop.run_until_complete(userbot.disconnect())
+        userbot.disconnect()
         return None
     owner = loop.run_until_complete(userbot.get_me())
     cfg["admin_ids"].add(owner.id)
