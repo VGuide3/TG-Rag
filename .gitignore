@@ -2,3 +2,5 @@
 *.session
 *.session-journal
 *.db
+.venv/
+__pycache__/
