@@ -4,7 +4,9 @@ Stores messages from allowed groups in SQLite FTS5 (per chat), retrieves the
 most relevant ones for questions, and sends them as context to an
 OpenAI-compatible chat completions endpoint. Web research (/web, the 🌐 button,
 or automatic fallback when the group has no answer) uses Serper (Google), Brave
-or Tavily search plus a stdlib page reader. Everything is driven by inline
+or Tavily search plus a stdlib page reader. /code turns research into a file.
+Optional userbot mode (TG_USER_SESSION, log in once with `python bot.py --login`)
+lets /read open any t.me link with your own account and summarize it. Everything is driven by inline
 buttons with callbacks; commands remain as shortcuts. Configuration comes from
 environment variables only.
 
@@ -13,18 +15,28 @@ to see regular group messages.
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
+from pathlib import Path
 
 from telethon import Button, TelegramClient, events
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import (
+    MessageNotModifiedError,
+    RPCError,
+    SessionPasswordNeededError,
+    UserAlreadyParticipantError,
+)
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.types import PeerChannel
 
 log = logging.getLogger("rag_bot")
 
@@ -38,6 +50,14 @@ PAGE_CHARS = 2500
 MAX_PAGE_BYTES = 1_000_000
 USER_AGENT = "Mozilla/5.0 (compatible; TG-RagBot/1.0)"
 NO_ANSWER = "NO_ANSWER"
+READ_CHARS = 24000
+CODE_EXT = {"python": "py", "py": "py", "javascript": "js", "js": "js", "typescript": "ts", "ts": "ts"}
+CODE_EXT.update({"bash": "sh", "sh": "sh", "html": "html", "sql": "sql", "go": "go", "rust": "rs", "json": "json"})
+TG_LINK = re.compile(
+    r"(?:https?://)?(?:t|telegram)\.me/(?:c/(?P<cid>\d+)|(?:\+|joinchat/)(?P<invite>[\w-]+)|(?:s/)?(?P<user>[A-Za-z]\w{3,}))"
+    r"(?:/(?P<msg>\d+))?",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = (
     "You answer questions for a Telegram group. Use only the provided context. "
@@ -47,11 +67,23 @@ WEB_PROMPT = (
     "You are a research assistant. Answer the question using the numbered web sources and cite them "
     "inline like [1]. Be concise and factual. If the sources are insufficient or disagree, say so."
 )
+READ_PROMPT = (
+    "Summarize this Telegram chat for the reader: main topics, key facts and decisions, frequent questions "
+    "with answers, important links, and any technical details or code. Use short bullet points."
+)
+CODE_PROMPT = (
+    "You are a senior engineer. Write complete, working code for the task using the provided context. "
+    "Default to Python unless the task says otherwise. Return one fenced code block, then a short note "
+    "on how to run it."
+)
 HELP_TEXT = (
     "❓ **How to use me**\n\n"
     "🔎 **Ask** – tap the button (or `/ask <question>`) and I answer from this group's history and notes.\n"
     "🌐 **Web search** – `/web <query>`: I search the web, read the top pages and answer with sources. "
     "If 🔎 Ask finds nothing in the group, I search the web automatically.\n"
+    "💻 **Code** – `/code <task>`: I research the web and send back a ready code file.\n"
+    "🕵️ **Read** – `/read <t.me link>` (bot admins, needs userbot login): I open any group or channel with "
+    "your account, summarize it, and can 💻 turn it into code or 🧠 save it to memory.\n"
     "📝 **Add note** – admins add facts to the group knowledge base (`/addnote <text>`).\n"
     "📚 **Notes** – browse and 🗑 delete notes.\n"
     "📊 **Stats** – what I know about this group.\n"
@@ -80,6 +112,8 @@ def load_config():
         "cooldown": float(os.environ.get("ASK_COOLDOWN", "5")),
         "search_provider": os.environ.get("SEARCH_PROVIDER", "serper").lower(),
         "search_key": os.environ.get("SEARCH_API_KEY", ""),
+        "user_session": os.environ.get("TG_USER_SESSION", ""),
+        "read_limit": int(os.environ.get("USERBOT_READ_LIMIT", "300")),
     }
 
 
@@ -310,27 +344,37 @@ def fetch_page_text(url, limit=PAGE_CHARS):
     return clip(html_to_text(raw.decode(charset, "replace")), limit)
 
 
-def build_web_messages(question, results):
-    blocks = [
+def web_blocks(results):
+    return [
         f"[{n}] {r['title']}\nURL: {r['url']}\n{r['snippet']}\n{r.get('page', '')}" for n, r in enumerate(results, 1)
     ]
+
+
+def build_web_messages(question, results):
     return [
         {"role": "system", "content": WEB_PROMPT},
-        {"role": "user", "content": "Sources:\n" + "\n\n".join(blocks) + f"\n\nQuestion: {question}"},
+        {"role": "user", "content": "Sources:\n" + "\n\n".join(web_blocks(results)) + f"\n\nQuestion: {question}"},
     ]
 
 
-async def research(cfg, question):
+async def gather_web(cfg, question):
     try:
         results = await asyncio.to_thread(web_search, cfg, question)
     except (OSError, KeyError, ValueError) as exc:
         log.warning("Web search failed: %s", exc)
-        return None, []
-    if not results:
-        return "🤷 No web results found.", []
+        return None
     pages = await asyncio.gather(*(asyncio.to_thread(fetch_page_text, r["url"]) for r in results[:PAGES_TO_READ]))
     for result, page in zip(results, pages):
         result["page"] = page
+    return results
+
+
+async def research(cfg, question):
+    results = await gather_web(cfg, question)
+    if results is None:
+        return None, []
+    if not results:
+        return "🤷 No web results found.", []
     sources = [{"title": r["title"], "url": r["url"]} for r in results]
     try:
         answer = await asyncio.to_thread(call_llm, cfg, build_web_messages(question, results))
@@ -338,6 +382,124 @@ async def research(cfg, question):
         log.warning("LLM call failed: %s", exc)
         return None, sources
     return answer, sources
+
+
+# --- code + userbot ------------------------------------------------------------
+
+
+def extract_code(reply):
+    match = re.search(r"```([\w+-]*)\n(.*?)```", reply, re.DOTALL)
+    if not match:
+        return reply.strip(), "", "py"
+    note = (reply[: match.start()] + reply[match.end() :]).strip()
+    return match.group(2), note, CODE_EXT.get(match.group(1).lower(), "py")
+
+
+async def generate_code(cfg, task, lines=None):
+    context = ""
+    if lines:
+        context = "Telegram chat:\n" + chat_context(lines)
+    elif cfg["search_key"]:
+        results = await gather_web(cfg, task)
+        context = "Web sources:\n" + "\n\n".join(web_blocks(results or []))
+    messages = [{"role": "system", "content": CODE_PROMPT}, {"role": "user", "content": f"{context}\n\nTask: {task}"}]
+    try:
+        reply = await asyncio.to_thread(call_llm, cfg, messages)
+    except (OSError, KeyError, IndexError, ValueError) as exc:
+        log.warning("LLM call failed: %s", exc)
+        return None
+    return extract_code(reply)
+
+
+def parse_tg_link(text):
+    if re.fullmatch(r"@[A-Za-z]\w{3,}", text):
+        return {"cid": None, "invite": None, "user": text[1:], "msg": None, "url": f"https://t.me/{text[1:]}"}
+    match = TG_LINK.fullmatch(text.strip().rstrip("/"))
+    if not match:
+        return None
+    url = match.group(0)
+    return {**match.groupdict(), "url": url if url.lower().startswith("http") else f"https://{url}"}
+
+
+def sender_name(sender):
+    if sender is None:
+        return "?"
+    name = getattr(sender, "first_name", None) or getattr(sender, "title", None) or "?"
+    username = getattr(sender, "username", None)
+    return f"{name} (@{username})" if username else name
+
+
+def chat_context(lines):
+    return "\n".join(lines)[-READ_CHARS:]
+
+
+async def resolve_chat(userbot, link):
+    if link["invite"]:
+        try:
+            return (await userbot(ImportChatInviteRequest(link["invite"]))).chats[0]
+        except UserAlreadyParticipantError:
+            return (await userbot(CheckChatInviteRequest(link["invite"]))).chat
+    target = PeerChannel(int(link["cid"])) if link["cid"] else link["user"]
+    try:
+        return await userbot.get_entity(target)
+    except ValueError:
+        await userbot.get_dialogs()
+        return await userbot.get_entity(target)
+
+
+async def read_chat(userbot, link, limit):
+    entity = await resolve_chat(userbot, link)
+    title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or "chat"
+    lines = []
+    async for msg in userbot.iter_messages(entity, limit=limit):
+        if msg.message:
+            lines.append(f"[{msg.date:%Y-%m-%d %H:%M}] {sender_name(msg.sender)}: {msg.message}")
+    lines.reverse()
+    if link["msg"]:
+        msg = await userbot.get_messages(entity, ids=int(link["msg"]))
+        if msg and msg.message:
+            lines.insert(0, f">>> Linked message from {sender_name(msg.sender)}: {msg.message}")
+    return title, lines
+
+
+async def summarize_chat(cfg, title, lines):
+    messages = [
+        {"role": "system", "content": READ_PROMPT},
+        {"role": "user", "content": f"Chat: {title}\n\n{chat_context(lines)}"},
+    ]
+    try:
+        return await asyncio.to_thread(call_llm, cfg, messages)
+    except (OSError, KeyError, IndexError, ValueError) as exc:
+        log.warning("LLM call failed: %s", exc)
+        return None
+
+
+async def userbot_login(cfg):
+    if not cfg["user_session"]:
+        sys.exit("Set TG_USER_SESSION to the session file path first.")
+    client = TelegramClient(cfg["user_session"], cfg["api_id"], cfg["api_hash"])
+    await client.connect()
+    hash_file = cfg["user_session"] + ".codehash"
+    try:
+        if await client.is_user_authorized():
+            print("Userbot already logged in.")
+            return
+        phone, code = os.environ["TG_PHONE"], os.environ.get("TG_LOGIN_CODE", "")
+        if not code:
+            sent = await client.send_code_request(phone)
+            Path(hash_file).write_text(sent.phone_code_hash)
+            print("Login code sent by Telegram. Run --login again with TG_LOGIN_CODE set.")
+            return
+        code_hash = Path(hash_file).read_text().strip()
+        try:
+            await client.sign_in(phone, code, phone_code_hash=code_hash)
+        except SessionPasswordNeededError:
+            await client.sign_in(password=os.environ["TG_2FA_PASSWORD"])
+        Path(hash_file).unlink()
+        me = await client.get_me()
+        print(f"Userbot logged in as {me.first_name} (id {me.id}).")
+    finally:
+        await client.disconnect()
 
 
 # --- views (text + buttons) --------------------------------------------------
@@ -396,10 +558,28 @@ def answer_view(ask_id, question, answer, rating=0, mode="rag", sources=None, we
             if web and mode != "web"
             else []
         ),
+        *([[Button.inline("💻 Turn into code", f"q:code:{ask_id}".encode())]] if mode == "web" and answer else []),
         [
             Button.inline(up, f"q:up:{ask_id}".encode(), style="success" if rating == 1 else None),
             Button.inline(down, f"q:dn:{ask_id}".encode(), style="danger" if rating == -1 else None),
         ],
+    ]
+    return text, buttons
+
+
+def read_view(ask_id, link, summary, source):
+    title = clip(source["title"], 200)
+    if summary is None:
+        body = f"⚠️ Read {len(source['lines'])} messages, but the language model is unavailable for a summary."
+    else:
+        body = clip(summary, 3400)
+    text = f"🕵️ **{title}** · {len(source['lines'])} messages\n\n{body}"
+    buttons = [
+        [
+            Button.inline("💻 Turn into code", f"q:code:{ask_id}".encode(), style="primary"),
+            Button.inline("🧠 Save to memory", f"q:save:{ask_id}".encode(), style="success"),
+        ],
+        [Button.url("🔗 Open", link), Button.inline("✖️ Close", b"x")],
     ]
     return text, buttons
 
@@ -409,7 +589,7 @@ def sources_view(ask_id, rows, web_sources=None):
         lines = [f"**{n}.** [{clip(s['title'] or s['url'], 120)}]({s['url']})" for n, s in enumerate(web_sources, 1)]
         text = clip("🌐 **Web sources**\n\n" + "\n".join(lines))
     elif rows:
-        icons = {"note": "📝", "msg": "💬"}
+        icons = {"note": "📝", "msg": "💬", "ext": "🕵️"}
         lines = [f"{icons.get(kind, '•')} {clip(text, 300)}" for text, kind, _ in rows]
         text = clip("📎 **Sources used**\n\n" + "\n\n".join(lines))
     else:
@@ -473,7 +653,7 @@ def confirm_clear_view():
 # --- handlers ----------------------------------------------------------------
 
 
-def register_handlers(client, cfg, db):
+def register_handlers(client, cfg, db, userbot=None):
     groups = cfg["allowed_groups"] or None
     pending = {}
     admin_cache = {}
@@ -533,6 +713,20 @@ def register_handlers(client, cfg, db):
     async def ask(event, question):
         await respond(event, question, "rag")
 
+    async def send_code(chat_id, reply_to, task, lines=None):
+        result = await generate_code(cfg, task, lines)
+        if result is None:
+            await client.send_message(chat_id, "⚠️ The language model is unavailable right now.", reply_to=reply_to)
+            return
+        code, note, ext = result
+        file = io.BytesIO(code.encode())
+        file.name = f"code.{ext}"
+        caption = clip(f"💻 {task}" + (f"\n\n{note}" if note else ""), 1000)
+        await client.send_file(chat_id, file, caption=caption, reply_to=reply_to, parse_mode=None)
+
+    def private_admin_only(event):
+        return event.is_private and event.sender_id not in cfg["admin_ids"]
+
     async def save_note(event, text):
         add_doc(db, event.chat_id, event.sender_id, text, "note", event.date.isoformat())
         await event.reply("📝✅ Note saved.", buttons=[[Button.inline("📚 View notes", b"m:notes:0")]])
@@ -572,6 +766,57 @@ def register_handlers(client, cfg, db):
             await event.reply("🌐 Usage: `/web <query>`, or tap 🌐 Web search in /menu.")
             return
         await respond(event, query, "web")
+
+    @client.on(events.NewMessage(pattern=r"(?s)^/code(?:@\w+)?(?:\s+(.+))?$"))
+    async def on_code(event):
+        if private_admin_only(event):
+            await event.reply("🔒 /code in private chat is for bot admins. Use it in a group.")
+            return
+        if not event.is_private and not allowed(event.chat_id):
+            return
+        task = (event.pattern_match.group(1) or "").strip()
+        if not task:
+            await event.reply("💻 Usage: `/code <what to build>`")
+            return
+        if on_cooldown(event.chat_id, event.sender_id):
+            await event.reply("⏳ Slow down a little, try again in a few seconds.")
+            return
+        placeholder = await event.reply("💻 Researching and writing code…")
+        await send_code(event.chat_id, event.id, task)
+        await placeholder.delete()
+
+    @client.on(events.NewMessage(pattern=r"^/read(?:@\w+)?(?:\s+(\S+))?$"))
+    async def on_read(event):
+        if event.sender_id not in cfg["admin_ids"]:
+            await event.reply("🔒 /read uses the owner's Telegram account, so it's for bot admins only.")
+            return
+        if not event.is_private and not allowed(event.chat_id):
+            return
+        if userbot is None:
+            await event.reply("🕵️ Userbot mode isn't logged in. Set TG_USER_SESSION and run `python bot.py --login`.")
+            return
+        link = parse_tg_link(event.pattern_match.group(1) or "")
+        if not link:
+            await event.reply("🕵️ Usage: `/read <t.me link or @username>`")
+            return
+        if on_cooldown(event.chat_id, event.sender_id):
+            await event.reply("⏳ Slow down a little, try again in a few seconds.")
+            return
+        placeholder = await event.reply("🕵️ Opening and reading…")
+        try:
+            title, lines = await read_chat(userbot, link, cfg["read_limit"])
+        except (ValueError, RPCError) as exc:
+            await placeholder.edit(f"⚠️ Couldn't open that link: {exc}")
+            return
+        if not lines:
+            await placeholder.edit(f"🤷 No text messages found in **{title}**.")
+            return
+        await placeholder.edit(f"🕵️ Read {len(lines)} messages from **{title}**, summarizing…")
+        summary = await summarize_chat(cfg, title, lines)
+        source = {"title": title, "lines": lines}
+        ask_id = save_ask(db, event.chat_id, event.sender_id, link["url"], summary, "read", source)
+        text, buttons = read_view(ask_id, link["url"], summary, source)
+        await placeholder.edit(text, buttons=buttons, link_preview=False)
 
     @client.on(events.NewMessage(chats=groups, pattern=r"^/addnote(?:@\w+)?(?:\s+(.+))?$"))
     async def on_addnote(event):
@@ -676,7 +921,29 @@ def register_handlers(client, cfg, db):
                 await event.answer("⌛ This answer has expired.", alert=True)
                 return
             _, question, answer, rating, mode, sources = row
-            if action in ("re", "web"):
+            if action == "code":
+                if on_cooldown(chat_id, user_id):
+                    await event.answer("⏳ Slow down a little.")
+                    return
+                await event.answer("💻 Writing code…")
+                if mode == "read":
+                    task = f"Turn the content of the Telegram chat '{sources['title']}' into working code"
+                    await send_code(chat_id, event.message_id, task, sources["lines"])
+                else:
+                    await send_code(chat_id, event.message_id, question)
+            elif action == "save" and mode == "read":
+                if event.is_private:
+                    await event.answer("🧠 Run /read in a group to save into that group's memory.", alert=True)
+                    return
+                if not await is_admin(chat_id, user_id):
+                    await event.answer("🔒 Admins only.", alert=True)
+                    return
+                for line in sources["lines"]:
+                    add_doc(db, chat_id, user_id, line, "ext")
+                await event.answer(f"🧠 Saved {len(sources['lines'])} messages to this group's memory.", alert=True)
+            elif mode == "read":
+                await show(read_view(ask_id, question, answer, sources))
+            elif action in ("re", "web"):
                 if on_cooldown(chat_id, user_id):
                     await event.answer("⏳ Slow down a little.")
                     return
@@ -712,12 +979,29 @@ def register_handlers(client, cfg, db):
     return load_me
 
 
+def start_userbot(cfg, loop):
+    userbot = TelegramClient(cfg["user_session"], cfg["api_id"], cfg["api_hash"])
+    loop.run_until_complete(userbot.connect())
+    if not loop.run_until_complete(userbot.is_user_authorized()):
+        log.warning("Userbot session is not logged in; run `python bot.py --login`. /read disabled.")
+        loop.run_until_complete(userbot.disconnect())
+        return None
+    owner = loop.run_until_complete(userbot.get_me())
+    cfg["admin_ids"].add(owner.id)
+    log.info("Userbot logged in as %s (id %s), added to admins", owner.first_name, owner.id)
+    return userbot
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config()
+    if "--login" in sys.argv:
+        asyncio.run(userbot_login(cfg))
+        return
     db = open_db(cfg["db_path"])
     client = TelegramClient(cfg["session"], cfg["api_id"], cfg["api_hash"])
-    load_me = register_handlers(client, cfg, db)
+    userbot = start_userbot(cfg, client.loop) if cfg["user_session"] else None
+    load_me = register_handlers(client, cfg, db, userbot)
     client.start(bot_token=cfg["bot_token"])
     client.loop.run_until_complete(load_me())
     log.info("Bot started; allowed groups: %s", sorted(cfg["allowed_groups"]) or "all")
