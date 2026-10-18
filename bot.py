@@ -2,7 +2,9 @@
 
 Stores messages from allowed groups in SQLite FTS5 (per chat), retrieves the
 most relevant ones for questions, and sends them as context to an
-OpenAI-compatible chat completions endpoint. Everything is driven by inline
+OpenAI-compatible chat completions endpoint. Web research (/web, the 🌐 button,
+or automatic fallback when the group has no answer) uses Serper (Google), Brave
+or Tavily search plus a stdlib page reader. Everything is driven by inline
 buttons with callbacks; commands remain as shortcuts. Configuration comes from
 environment variables only.
 
@@ -17,7 +19,9 @@ import os
 import re
 import sqlite3
 import time
+import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageNotModifiedError
@@ -28,19 +32,31 @@ MAX_TEXT = 4000
 NOTES_PER_PAGE = 5
 PENDING_TTL = 120
 ADMIN_CACHE_TTL = 300
+SEARCH_RESULTS = 5
+PAGES_TO_READ = 3
+PAGE_CHARS = 2500
+MAX_PAGE_BYTES = 1_000_000
+USER_AGENT = "Mozilla/5.0 (compatible; TG-RagBot/1.0)"
+NO_ANSWER = "NO_ANSWER"
 
 SYSTEM_PROMPT = (
     "You answer questions for a Telegram group. Use only the provided context. "
-    "If the context does not contain the answer, say you don't know."
+    f"If the context does not contain the answer, reply with exactly {NO_ANSWER}."
+)
+WEB_PROMPT = (
+    "You are a research assistant. Answer the question using the numbered web sources and cite them "
+    "inline like [1]. Be concise and factual. If the sources are insufficient or disagree, say so."
 )
 HELP_TEXT = (
     "❓ **How to use me**\n\n"
     "🔎 **Ask** – tap the button (or `/ask <question>`) and I answer from this group's history and notes.\n"
+    "🌐 **Web search** – `/web <query>`: I search the web, read the top pages and answer with sources. "
+    "If 🔎 Ask finds nothing in the group, I search the web automatically.\n"
     "📝 **Add note** – admins add facts to the group knowledge base (`/addnote <text>`).\n"
     "📚 **Notes** – browse and 🗑 delete notes.\n"
     "📊 **Stats** – what I know about this group.\n"
     "⚙️ **Settings** – admins toggle learning or 🧹 clear history.\n\n"
-    "Under each answer: 🔁 regenerate · 📎 sources · 👍/👎 feedback."
+    "Under each answer: 🔁 regenerate · 📎 sources · 🌐 search web · 👍/👎 feedback."
 )
 
 
@@ -62,6 +78,8 @@ def load_config():
         "session": os.environ.get("TG_SESSION_NAME", "rag_bot"),
         "top_k": int(os.environ.get("RAG_TOP_K", "8")),
         "cooldown": float(os.environ.get("ASK_COOLDOWN", "5")),
+        "search_provider": os.environ.get("SEARCH_PROVIDER", "serper").lower(),
+        "search_key": os.environ.get("SEARCH_API_KEY", ""),
     }
 
 
@@ -78,6 +96,11 @@ def open_db(path):
         " question TEXT, answer TEXT, rating INTEGER DEFAULT 0);"
         "CREATE TABLE IF NOT EXISTS settings (chat_id INTEGER PRIMARY KEY, learn INTEGER DEFAULT 1);"
     )
+    for column in ("mode TEXT DEFAULT 'rag'", "sources TEXT"):
+        try:
+            db.execute(f"ALTER TABLE asks ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass
     return db
 
 
@@ -134,17 +157,22 @@ def chat_stats(db, chat_id):
     return {"msgs": msgs or 0, "notes": notes or 0, "last": last or "–", "asks": asks, "up": up or 0, "down": down or 0}
 
 
-def save_ask(db, chat_id, user_id, question, answer):
+def save_ask(db, chat_id, user_id, question, answer, mode="rag", sources=None):
     cur = db.execute(
-        "INSERT INTO asks (chat_id, user_id, question, answer) VALUES (?, ?, ?, ?)",
-        (chat_id, user_id, question, answer),
+        "INSERT INTO asks (chat_id, user_id, question, answer, mode, sources) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, user_id, question, answer, mode, json.dumps(sources) if sources else None),
     )
     db.commit()
     return cur.lastrowid
 
 
 def get_ask(db, ask_id):
-    return db.execute("SELECT chat_id, question, answer, rating FROM asks WHERE id = ?", (ask_id,)).fetchone()
+    row = db.execute(
+        "SELECT chat_id, question, answer, rating, mode, sources FROM asks WHERE id = ?", (ask_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return (*row[:5], json.loads(row[5]) if row[5] else None)
 
 
 def update_ask(db, ask_id, **fields):
@@ -176,25 +204,140 @@ def build_messages(question, rows):
     ]
 
 
-def call_llm(cfg, messages):
-    body = json.dumps({"model": cfg["llm_model"], "messages": messages}).encode()
-    req = urllib.request.Request(
-        cfg["llm_url"],
-        data=body,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {cfg['llm_key']}"},
+def json_request(url, payload, headers):
+    return urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", **headers}
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.load(resp)
+
+
+def http_json(req, timeout=20):
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def call_llm(cfg, messages):
+    req = json_request(
+        cfg["llm_url"],
+        {"model": cfg["llm_model"], "messages": messages},
+        {"Authorization": f"Bearer {cfg['llm_key']}"},
+    )
+    data = http_json(req, timeout=60)
     return data["choices"][0]["message"]["content"].strip()
 
 
 async def generate_answer(cfg, db, chat_id, question):
     rows = search(db, chat_id, question, cfg["top_k"])
     try:
-        return await asyncio.to_thread(call_llm, cfg, build_messages(question, rows))
+        answer = await asyncio.to_thread(call_llm, cfg, build_messages(question, rows))
     except (OSError, KeyError, IndexError, ValueError) as exc:
         log.warning("LLM call failed: %s", exc)
         return None
+    return NO_ANSWER if NO_ANSWER in answer and len(answer) < 40 else answer
+
+
+# --- web research --------------------------------------------------------------
+
+
+def strip_tags(text):
+    return re.sub(r"<[^>]+>", "", text or "")
+
+
+def web_search(cfg, query, limit=SEARCH_RESULTS):
+    provider, key = cfg["search_provider"], cfg["search_key"]
+    if provider == "brave":
+        url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode({"q": query, "count": limit})
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "X-Subscription-Token": key})
+        items = http_json(req).get("web", {}).get("results", [])
+        fields = ("title", "url", "description")
+    elif provider == "tavily":
+        req = json_request(
+            "https://api.tavily.com/search", {"query": query, "max_results": limit}, {"Authorization": f"Bearer {key}"}
+        )
+        items = http_json(req).get("results", [])
+        fields = ("title", "url", "content")
+    else:
+        req = json_request("https://google.serper.dev/search", {"q": query, "num": limit}, {"X-API-KEY": key})
+        items = http_json(req).get("organic", [])
+        fields = ("title", "link", "snippet")
+    title, url, snippet = fields
+    return [
+        {"title": strip_tags(i.get(title)), "url": i.get(url, ""), "snippet": strip_tags(i.get(snippet))}
+        for i in items[:limit]
+        if i.get(url)
+    ]
+
+
+SKIP_TAGS = frozenset({"script", "style", "noscript", "svg", "head", "nav", "footer", "form"})
+
+
+class PageText(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in SKIP_TAGS:
+            self.depth += 1
+
+    def handle_endtag(self, tag):
+        if tag in SKIP_TAGS and self.depth:
+            self.depth -= 1
+
+    def handle_data(self, data):
+        if not self.depth:
+            self.parts.append(data)
+
+
+def html_to_text(html):
+    parser = PageText()
+    parser.feed(html)
+    return " ".join(" ".join(parser.parts).split())
+
+
+def fetch_page_text(url, limit=PAGE_CHARS):
+    if not url.startswith(("http://", "https://")):
+        return ""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if "html" not in resp.headers.get("Content-Type", ""):
+                return ""
+            raw = resp.read(MAX_PAGE_BYTES)
+            charset = resp.headers.get_content_charset() or "utf-8"
+    except (OSError, ValueError):
+        return ""
+    return clip(html_to_text(raw.decode(charset, "replace")), limit)
+
+
+def build_web_messages(question, results):
+    blocks = [
+        f"[{n}] {r['title']}\nURL: {r['url']}\n{r['snippet']}\n{r.get('page', '')}" for n, r in enumerate(results, 1)
+    ]
+    return [
+        {"role": "system", "content": WEB_PROMPT},
+        {"role": "user", "content": "Sources:\n" + "\n\n".join(blocks) + f"\n\nQuestion: {question}"},
+    ]
+
+
+async def research(cfg, question):
+    try:
+        results = await asyncio.to_thread(web_search, cfg, question)
+    except (OSError, KeyError, ValueError) as exc:
+        log.warning("Web search failed: %s", exc)
+        return None, []
+    if not results:
+        return "🤷 No web results found.", []
+    pages = await asyncio.gather(*(asyncio.to_thread(fetch_page_text, r["url"]) for r in results[:PAGES_TO_READ]))
+    for result, page in zip(results, pages):
+        result["page"] = page
+    sources = [{"title": r["title"], "url": r["url"]} for r in results]
+    try:
+        answer = await asyncio.to_thread(call_llm, cfg, build_web_messages(question, results))
+    except (OSError, KeyError, IndexError, ValueError) as exc:
+        log.warning("LLM call failed: %s", exc)
+        return None, sources
+    return answer, sources
 
 
 # --- views (text + buttons) --------------------------------------------------
@@ -207,7 +350,8 @@ def clip(text, limit=MAX_TEXT):
 def home_view(bot_username, private):
     if private:
         text = (
-            "👋 **Hi! I'm a group knowledge bot.**\n\nAdd me to a group, make me admin, and I'll learn and answer. 🧠"
+            "👋 **Hi! I'm a group knowledge bot.**\n\nAdd me to a group, make me admin, and I'll learn and answer. 🧠\n"
+            "Bot admins can also use `/web <query>` here for 🌐 web research."
         )
         buttons = [
             [Button.url("➕ Add me to a group", f"https://t.me/{bot_username}?startgroup=true", style="primary")],
@@ -216,10 +360,10 @@ def home_view(bot_username, private):
         return text, buttons
     text = "🤖 **Group Knowledge Bot**\n\nPick an option below 👇"
     buttons = [
-        [Button.inline("🔎 Ask", b"m:ask", style="primary"), Button.inline("📝 Add note", b"m:note")],
-        [Button.inline("📚 Notes", b"m:notes:0"), Button.inline("📊 Stats", b"m:stats")],
-        [Button.inline("⚙️ Settings", b"m:set"), Button.inline("❓ Help", b"m:help")],
-        [Button.inline("✖️ Close", b"x")],
+        [Button.inline("🔎 Ask", b"m:ask", style="primary"), Button.inline("🌐 Web search", b"m:web", style="primary")],
+        [Button.inline("📝 Add note", b"m:note"), Button.inline("📚 Notes", b"m:notes:0")],
+        [Button.inline("📊 Stats", b"m:stats"), Button.inline("⚙️ Settings", b"m:set")],
+        [Button.inline("❓ Help", b"m:help"), Button.inline("✖️ Close", b"x")],
     ]
     return text, buttons
 
@@ -228,11 +372,18 @@ def back_row():
     return [Button.inline("🏠 Menu", b"m:home"), Button.inline("✖️ Close", b"x")]
 
 
-def answer_view(ask_id, question, answer, rating=0):
+def answer_view(ask_id, question, answer, rating=0, mode="rag", sources=None, web=False):
+    icon = "🌐" if mode == "web" else "❓"
+    header = f"{icon} **{clip(question, 300)}**\n\n"
     if answer is None:
-        text = f"❓ **{clip(question, 300)}**\n\n⚠️ The language model is unavailable right now. Try 🔁 again."
+        text = header + "⚠️ The language model or search is unavailable right now. Try 🔁 again."
+    elif answer == NO_ANSWER:
+        text = header + "🤷 I couldn't find that in this group's knowledge." + (" Tap 🌐 Search web." if web else "")
+    elif mode == "web":
+        links = " · ".join(f"[{n}]({s['url']})" for n, s in enumerate(sources or [], 1))
+        text = header + clip(answer, 3300) + (f"\n\n🔗 {links}" if links else "")
     else:
-        text = clip(f"❓ **{clip(question, 300)}**\n\n💡 {answer}")
+        text = clip(header + f"💡 {answer}")
     up = "👍✅" if rating == 1 else "👍"
     down = "👎✅" if rating == -1 else "👎"
     buttons = [
@@ -240,6 +391,11 @@ def answer_view(ask_id, question, answer, rating=0):
             Button.inline("🔁 Regenerate", f"q:re:{ask_id}".encode(), style="primary"),
             Button.inline("📎 Sources", f"q:src:{ask_id}".encode()),
         ],
+        *(
+            [[Button.inline("🌐 Search web", f"q:web:{ask_id}".encode(), style="primary")]]
+            if web and mode != "web"
+            else []
+        ),
         [
             Button.inline(up, f"q:up:{ask_id}".encode(), style="success" if rating == 1 else None),
             Button.inline(down, f"q:dn:{ask_id}".encode(), style="danger" if rating == -1 else None),
@@ -248,8 +404,11 @@ def answer_view(ask_id, question, answer, rating=0):
     return text, buttons
 
 
-def sources_view(ask_id, rows):
-    if rows:
+def sources_view(ask_id, rows, web_sources=None):
+    if web_sources:
+        lines = [f"**{n}.** [{clip(s['title'] or s['url'], 120)}]({s['url']})" for n, s in enumerate(web_sources, 1)]
+        text = clip("🌐 **Web sources**\n\n" + "\n".join(lines))
+    elif rows:
         icons = {"note": "📝", "msg": "💬"}
         lines = [f"{icons.get(kind, '•')} {clip(text, 300)}" for text, kind, _ in rows]
         text = clip("📎 **Sources used**\n\n" + "\n\n".join(lines))
@@ -343,15 +502,36 @@ def register_handlers(client, cfg, db):
         last_ask[key] = now
         return False
 
-    async def ask(event, question):
+    web = bool(cfg["search_key"])
+
+    async def answer_flow(chat_id, question, status, mode="rag"):
+        if mode == "rag":
+            answer = await generate_answer(cfg, db, chat_id, question)
+            if answer != NO_ANSWER or not web:
+                return answer, "rag", None
+            await status(f"🌐 **{clip(question, 300)}**\n\n🔎 Not in group memory, searching the web…")
+        answer, sources = await research(cfg, question)
+        return answer, "web", sources
+
+    async def respond(event, question, mode):
         if on_cooldown(event.chat_id, event.sender_id):
             await event.reply("⏳ Slow down a little, try again in a few seconds.")
             return
-        placeholder = await event.reply("🤔 Thinking…")
-        answer = await generate_answer(cfg, db, event.chat_id, question)
-        ask_id = save_ask(db, event.chat_id, event.sender_id, question, answer)
-        text, buttons = answer_view(ask_id, question, answer)
-        await placeholder.edit(text, buttons=buttons)
+        if mode == "web" and not web:
+            await event.reply("🌐 Web search isn't configured yet (set `SEARCH_API_KEY`).")
+            return
+        placeholder = await event.reply("🌐 Researching…" if mode == "web" else "🤔 Thinking…")
+
+        async def status(text):
+            await placeholder.edit(text)
+
+        answer, mode, sources = await answer_flow(event.chat_id, question, status, mode)
+        ask_id = save_ask(db, event.chat_id, event.sender_id, question, answer, mode, sources)
+        text, buttons = answer_view(ask_id, question, answer, mode=mode, sources=sources, web=web)
+        await placeholder.edit(text, buttons=buttons, link_preview=False)
+
+    async def ask(event, question):
+        await respond(event, question, "rag")
 
     async def save_note(event, text):
         add_doc(db, event.chat_id, event.sender_id, text, "note", event.date.isoformat())
@@ -364,8 +544,8 @@ def register_handlers(client, cfg, db):
         key = (event.chat_id, event.sender_id)
         action = pending.pop(key, None)
         if action and action[1] > time.monotonic():
-            if action[0] == "ask":
-                await ask(event, event.raw_text)
+            if action[0] in ("ask", "web"):
+                await respond(event, event.raw_text, "rag" if action[0] == "ask" else "web")
             else:
                 await save_note(event, event.raw_text)
             return
@@ -379,6 +559,19 @@ def register_handlers(client, cfg, db):
             await event.reply("🔎 Usage: `/ask <question>`, or tap 🔎 Ask in /menu.")
             return
         await ask(event, question)
+
+    @client.on(events.NewMessage(pattern=r"^/web(?:@\w+)?(?:\s+(.+))?$"))
+    async def on_web(event):
+        if event.is_private and event.sender_id not in cfg["admin_ids"]:
+            await event.reply("🔒 Web research in private chat is for bot admins. Use it in a group.")
+            return
+        if not event.is_private and not allowed(event.chat_id):
+            return
+        query = (event.pattern_match.group(1) or "").strip()
+        if not query:
+            await event.reply("🌐 Usage: `/web <query>`, or tap 🌐 Web search in /menu.")
+            return
+        await respond(event, query, "web")
 
     @client.on(events.NewMessage(chats=groups, pattern=r"^/addnote(?:@\w+)?(?:\s+(.+))?$"))
     async def on_addnote(event):
@@ -410,7 +603,7 @@ def register_handlers(client, cfg, db):
         async def show(view, toast=None):
             text, buttons = view
             try:
-                await event.edit(text, buttons=buttons)
+                await event.edit(text, buttons=buttons, link_preview=False)
             except MessageNotModifiedError:
                 pass
             await event.answer(toast)
@@ -424,19 +617,23 @@ def register_handlers(client, cfg, db):
         if data == "m:help":
             await show((HELP_TEXT, [back_row()] if not event.is_private else None))
             return
-        if event.is_private or not allowed(chat_id):
+        if not data.startswith("q:") and (event.is_private or not allowed(chat_id)):
             await event.answer("🚫 This only works in enabled groups.", alert=True)
             return
 
         if data == "m:home":
             await show(home_view(me["username"], False))
-        elif data in ("m:ask", "m:note"):
+        elif data in ("m:ask", "m:note", "m:web"):
             if data == "m:note" and not await is_admin(chat_id, user_id):
                 await event.answer("🔒 Only admins can add notes.", alert=True)
                 return
-            pending[(chat_id, user_id)] = ("ask" if data == "m:ask" else "note", time.monotonic() + PENDING_TTL)
-            prompt = "✍️ Send your question now" if data == "m:ask" else "✍️ Send the note text now"
-            await event.answer(f"{prompt} (2 min).", alert=True)
+            if data == "m:web" and not web:
+                await event.answer("🌐 Web search isn't configured yet (SEARCH_API_KEY).", alert=True)
+                return
+            action = data[2:]
+            pending[(chat_id, user_id)] = (action, time.monotonic() + PENDING_TTL)
+            prompt = {"ask": "✍️ Send your question now", "web": "🌐 Send what to research now"}
+            await event.answer(f"{prompt.get(action, '✍️ Send the note text now')} (2 min).", alert=True)
         elif data.startswith("m:notes:"):
             page = max(0, int(data.split(":")[2]))
             rows, total = list_notes(db, chat_id, page)
@@ -478,27 +675,34 @@ def register_handlers(client, cfg, db):
             if not row or row[0] != chat_id:
                 await event.answer("⌛ This answer has expired.", alert=True)
                 return
-            _, question, answer, rating = row
-            if action == "re":
+            _, question, answer, rating, mode, sources = row
+            if action in ("re", "web"):
                 if on_cooldown(chat_id, user_id):
                     await event.answer("⏳ Slow down a little.")
                     return
-                await event.answer("🔁 Regenerating…")
-                await event.edit(f"❓ **{clip(question, 300)}**\n\n🤔 Thinking…")
-                answer = await generate_answer(cfg, db, chat_id, question)
-                update_ask(db, ask_id, answer=answer, rating=0)
-                text, buttons = answer_view(ask_id, question, answer)
-                await event.edit(text, buttons=buttons)
+                if action == "web" and not web:
+                    await event.answer("🌐 Web search isn't configured yet.", alert=True)
+                    return
+                mode = "web" if action == "web" else mode
+                await event.answer("🌐 Researching…" if mode == "web" else "🔁 Regenerating…")
+                await event.edit(f"{'🌐' if mode == 'web' else '❓'} **{clip(question, 300)}**\n\n🤔 Thinking…")
+                answer, mode, sources = await answer_flow(chat_id, question, event.edit, mode)
+                update_ask(
+                    db, ask_id, answer=answer, rating=0, mode=mode, sources=json.dumps(sources) if sources else None
+                )
+                text, buttons = answer_view(ask_id, question, answer, mode=mode, sources=sources, web=web)
+                await event.edit(text, buttons=buttons, link_preview=False)
             elif action == "src":
-                await show(sources_view(ask_id, search(db, chat_id, question, cfg["top_k"])))
+                rows = [] if mode == "web" else search(db, chat_id, question, cfg["top_k"])
+                await show(sources_view(ask_id, rows, sources if mode == "web" else None))
             elif action == "ans":
-                await show(answer_view(ask_id, question, answer, rating))
+                await show(answer_view(ask_id, question, answer, rating, mode, sources, web))
             elif action in ("up", "dn"):
                 new = 1 if action == "up" else -1
                 new = 0 if rating == new else new
                 update_ask(db, ask_id, rating=new)
                 toast = {1: "👍 Thanks for the feedback!", -1: "👎 Noted, thanks!", 0: "↩️ Feedback removed"}[new]
-                await show(answer_view(ask_id, question, answer, new), toast)
+                await show(answer_view(ask_id, question, answer, new, mode, sources, web), toast)
         else:
             await event.answer()
 
