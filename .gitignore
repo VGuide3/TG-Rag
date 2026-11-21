@@ -2,3 +2,6 @@
 *.session
 *.session-journal
 *.db
+.venv/
+__pycache__/
+*.codehash
